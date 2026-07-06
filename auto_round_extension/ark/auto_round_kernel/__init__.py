@@ -406,6 +406,10 @@ def sdpa(
     is_causal: bool = False,
     scale: float | None = None,
     tensor_layout: str = "HND",
+    use_alibi: bool = False,
+    use_tanh: bool = False,
+    prefer_fp32: bool = False,
+    n_padding: int = 0,
 ) -> torch.Tensor:
     """Scaled dot-product attention (SDPA) prefill+decode.
 
@@ -416,12 +420,34 @@ def sdpa(
     Args:
     - scale: Softmax scale. Uses 1 / sqrt(D) when None.
     - tensor_layout: Layout of Q/K/V/O tensors.
+    - use_alibi: Enable ALiBi position bias (head-num-derived slopes; only
+      supported on the BestLA mixed-precision CPU path, i.e. Q=float32 with
+      K/V=float16|bfloat16 and ARK_UNSAFE_BESTLA_MIXED_SDPA=1). [CPU-only]
+    - use_tanh: Apply tanh activation to the scaled QK scores before softmax
+      (effective score = 30 * tanh(raw_score / 30)). Same path restrictions as
+      use_alibi. Only supported on AVX512F+ hardware. [CPU-only]
+    - prefer_fp32: Prefer fp32 compute for the BestLA mixed path (selects the
+      AVX512F fp32-score path over AMX-BF16 for bf16 K/V; no-op for fp16 K/V
+      which is already fp32-score; no-op on the scalar Tier-0 path). [CPU-only]
+    - n_padding: Number of valid (non-padding) K/V positions when the K/V
+      sequence is right-padded. Must be in (0, seq_kv] and mutually exclusive
+      with is_causal. Only supported on the BestLA mixed-precision CPU path
+      with ARK_UNSAFE_BESTLA_MIXED_SDPA=1. [CPU-only]
 
     Returns:
     - O: same layout as the input tensors.
     """
     if query.device.type not in ("cpu", "xpu"):
         raise NotImplementedError(f"sdpa is not supported on {query.device.type}")
+
+    # BestLA-specific flags (use_alibi, use_tanh, prefer_fp32, n_padding) are
+    # only wired for the CPU path. Reject them early on XPU so callers get a
+    # clear error rather than silently missing the feature.
+    if query.device.type == "xpu" and (use_alibi or use_tanh or prefer_fp32 or n_padding):
+        raise NotImplementedError(
+            "use_alibi, use_tanh, prefer_fp32, and n_padding are CPU-only BestLA "
+            "features and are not supported on XPU"
+        )
 
     supported_dtypes = (torch.float32, torch.float16, torch.bfloat16) if query.device.type == "cpu" else (
         torch.float16,
@@ -490,7 +516,12 @@ def sdpa(
     k_strides = _attention_strides_qko(key, tensor_layout)
     v_strides = _attention_strides_v(value, tensor_layout)
     o_strides = _attention_strides_qko(O, tensor_layout)
-    lib.sdpa(
+
+    # The CPU C++ ABI accepts four extra BestLA-specific parameters after
+    # is_causal (use_alibi, use_tanh, prefer_fp32, n_padding). The XPU C++
+    # function has a different signature without these; they are not passed for
+    # that path (rejected by the device check above when non-default).
+    _common_sdpa_args = (
         stream,
         query.data_ptr(),
         key.data_ptr(),
@@ -513,6 +544,10 @@ def sdpa(
         float(scale) if scale is not None else 1.0 / (D**0.5),
         bool(is_causal),
     )
+    if query.device.type == "cpu":
+        lib.sdpa(*_common_sdpa_args, bool(use_alibi), bool(use_tanh), bool(prefer_fp32), int(n_padding))
+    else:
+        lib.sdpa(*_common_sdpa_args)
     return O
 
 
