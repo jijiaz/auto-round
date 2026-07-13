@@ -84,7 +84,7 @@ static inline constexpr dnnl::memory::data_type to_dt() {
   else if constexpr (std::is_same_v<T, bestla::utils::bf16>)
     return dnnl::memory::data_type::bf16;
   else
-    static_assert(0);
+    static_assert(sizeof(T) == 0, "unsupported data type for to_dt<T>()");
 }
 
 static inline constexpr dnnl::memory::data_type to_dt(BTLA_DTYPE bt) {
