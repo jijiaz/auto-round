@@ -62,14 +62,15 @@ void flash_attn_prefill(sycl::queue* q, void* Q_ptr, void* K_ptr, void* V_ptr, v
                int k_stride_s, int k_stride_d, int k_stride_h, int k_stride_b, int v_stride_d,
                int v_stride_s, int v_stride_h, int v_stride_b, int o_stride_s, int o_stride_d,
                int o_stride_h, int o_stride_b, int batch, int num_heads_q, int num_heads_kv,
-               int seq_len_q, int seq_len_kv, int head_dim, float softmax_scale, bool is_causal);
+               int seq_len_q, int seq_len_kv, int head_dim, float softmax_scale, bool is_causal,
+               float* lse = nullptr);
 
 void sdpa_impl(sycl::queue* q, void* Q_ptr, void* K_ptr, void* V_ptr, void* O_ptr, void* mask, BTLA_DTYPE q_dtype,
                int q_stride_s, int q_stride_d, int q_stride_h, int q_stride_b, int k_stride_s, int k_stride_d,
                int k_stride_h, int k_stride_b, int v_stride_d, int v_stride_s, int v_stride_h, int v_stride_b,
                int o_stride_s, int o_stride_d, int o_stride_h, int o_stride_b, int batch, int num_heads_q,
                int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
-               float softmax_scale, bool is_causal);
+               float softmax_scale, bool is_causal, float* lse = nullptr);
 
 void sdpa_impl_qks8_pvhalf(sycl::queue* q, void* Q_ptr, void* K_ptr, void* V_ptr, void* O_ptr, void* mask,
                int scale_block_size, void* qscale, void* kscale, int q_stride_s, int q_stride_d, int q_stride_h,
@@ -77,7 +78,7 @@ void sdpa_impl_qks8_pvhalf(sycl::queue* q, void* Q_ptr, void* K_ptr, void* V_ptr
                int v_stride_s, int v_stride_h, int v_stride_b, int o_stride_s, int o_stride_d, int o_stride_h,
                int o_stride_b, int batch, int num_heads_q, int num_heads_kv, int seq_len_q,
                int seq_len_kv, int head_dim, float softmax_scale, bool is_causal,
-               BTLA_DTYPE pv_dtype = BTLA_DTYPE::F16);
+               BTLA_DTYPE pv_dtype = BTLA_DTYPE::F16, float* lse = nullptr);
 
 void sdpa_impl_qks8_pvi8(sycl::queue* q, void* Q_ptr, void* K_ptr, void* V_ptr, void* O_ptr, void* mask,
                          int scale_block_size, void* qscale, void* kscale, void* vscale, int q_stride_s,
@@ -85,7 +86,8 @@ void sdpa_impl_qks8_pvi8(sycl::queue* q, void* Q_ptr, void* K_ptr, void* V_ptr, 
                          int k_stride_h, int k_stride_b, int v_stride_d, int v_stride_s, int v_stride_h,
                          int v_stride_b, int o_stride_s, int o_stride_d, int o_stride_h, int o_stride_b,
                          int batch, int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
-                         float softmax_scale, bool is_causal, BTLA_DTYPE o_dtype = BTLA_DTYPE::F16);
+                         float softmax_scale, bool is_causal, BTLA_DTYPE o_dtype = BTLA_DTYPE::F16,
+                         float* lse = nullptr);
 #endif  // ARK_SYCL_TLA
 
 }  // namespace ark

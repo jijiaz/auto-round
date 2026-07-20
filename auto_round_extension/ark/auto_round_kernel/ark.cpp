@@ -42,6 +42,9 @@ typedef uintptr_t torch_ptr;
 namespace ark {
 namespace py = pybind11;
 
+constexpr int TENSOR_LAYOUT_HND = 0;  // [B, H, S, D]
+constexpr int TENSOR_LAYOUT_NHD = 1;  // [B, S, H, D]
+
 static std::vector<int> parse_batch_n_padding(py::handle n_padding_obj, int batch, const char* func_name) {
   if (n_padding_obj.is_none()) {
     return {};
@@ -162,33 +165,49 @@ static size_t packed_weight_size(torch_ptr stream, int n, int k, int blocksize, 
 #if defined(ARK_XPU) && defined(ARK_SYCL_TLA)
 
 static void sdpa(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                 int q_stride_s, int q_stride_d, int q_stride_h, int q_stride_b, int k_stride_s, int k_stride_d,
-                 int k_stride_h, int k_stride_b, int v_stride_d, int v_stride_s, int v_stride_h, int v_stride_b,
-                 int o_stride_s, int o_stride_d, int o_stride_h, int o_stride_b, int q_dtype, int k_dtype, int o_dtype,
-                 int batch, int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
-                 float softmax_scale, bool is_causal) {
+                 int q_dtype, int k_dtype, int o_dtype, int batch, int num_heads_q, int num_heads_kv, int seq_len_q,
+                 int seq_len_kv, int head_dim, float softmax_scale, bool is_causal, int tensor_layout,
+                 torch_ptr lse = 0) {
   if (k_dtype != q_dtype || o_dtype != q_dtype) {
     throw std::invalid_argument("ark::sdpa: k_dtype and o_dtype must match q_dtype");
   }
-  if(q_dtype != (int)BTLA_DTYPE::F16 && q_dtype != (int)BTLA_DTYPE::BF16) {
+  if (q_dtype != (int)BTLA_DTYPE::F16 && q_dtype != (int)BTLA_DTYPE::BF16) {
     throw std::invalid_argument("ark::sdpa: only FP16 and BF16 are supported");
   }
   if (mask && is_causal) {
     throw std::invalid_argument("ark::sdpa: mask and is_causal cannot both be set");
   }
+  int q_stride_s, q_stride_d, q_stride_h, q_stride_b;
+  int k_stride_s, k_stride_d, k_stride_h, k_stride_b;
+  int v_stride_d, v_stride_s, v_stride_h, v_stride_b;
+  int o_stride_s, o_stride_d, o_stride_h, o_stride_b;
+  if (tensor_layout == TENSOR_LAYOUT_HND) {
+    int q_sh = seq_len_q * head_dim;
+    int k_sh = seq_len_kv * head_dim;
+    q_stride_s = head_dim;       q_stride_d = 1;   q_stride_h = q_sh;   q_stride_b = num_heads_q * q_sh;
+    k_stride_s = head_dim;       k_stride_d = 1;   k_stride_h = k_sh;   k_stride_b = num_heads_kv * k_sh;
+    v_stride_d = 1;              v_stride_s = head_dim; v_stride_h = k_sh;   v_stride_b = num_heads_kv * k_sh;
+    o_stride_s = head_dim;       o_stride_d = 1;   o_stride_h = q_sh;   o_stride_b = num_heads_q * q_sh;
+  } else {
+    int q_hd = num_heads_q * head_dim;
+    int k_hd = num_heads_kv * head_dim;
+    q_stride_s = q_hd;           q_stride_d = 1;   q_stride_h = head_dim; q_stride_b = seq_len_q * q_hd;
+    k_stride_s = k_hd;           k_stride_d = 1;   k_stride_h = head_dim; k_stride_b = seq_len_kv * k_hd;
+    v_stride_d = 1;              v_stride_s = k_hd; v_stride_h = head_dim; v_stride_b = seq_len_kv * k_hd;
+    o_stride_s = q_hd;           o_stride_d = 1;   o_stride_h = head_dim; o_stride_b = seq_len_q * q_hd;
+  }
   ark::sdpa_impl((sycl::queue*)stream, (void*)Q, (void*)K, (void*)V, (void*)O, (void*)mask, (BTLA_DTYPE)(q_dtype),
                  q_stride_s, q_stride_d, q_stride_h, q_stride_b, k_stride_s, k_stride_d, k_stride_h, k_stride_b,
                  v_stride_d, v_stride_s, v_stride_h, v_stride_b, o_stride_s, o_stride_d, o_stride_h, o_stride_b,
-                 batch, num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal);
+                 batch, num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal,
+                 (float*)lse);
 }
 
 static void sagev1_impl(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                        int scale_block_size, int q_stride_s, int q_stride_d, int q_stride_h, int q_stride_b,
-                        int k_stride_s, int k_stride_d, int k_stride_h, int k_stride_b, int v_stride_d,
-                        int v_stride_s, int v_stride_h, int v_stride_b, int o_stride_s, int o_stride_d,
-                        int o_stride_h, int o_stride_b, int q_dtype, int k_dtype, int v_dtype, int o_dtype,
-                        int batch, int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
-                        float softmax_scale, bool is_causal, bool use_int8_pv) {
+                       int scale_block_size, int q_dtype, int k_dtype, int v_dtype, int o_dtype, int batch,
+                       int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
+                       float softmax_scale, bool is_causal, bool use_int8_pv, int tensor_layout, bool use_mean_bias,
+                       torch_ptr lse = 0) {
   if (mask && is_causal) {
     throw std::invalid_argument("ark::sagev1: mask and is_causal cannot both be set");
   }
@@ -198,19 +217,39 @@ static void sagev1_impl(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V,
   if (q_dtype != (int)BTLA_DTYPE::F16 && q_dtype != (int)BTLA_DTYPE::BF16) {
     throw std::invalid_argument("ark::sagev1: only F16 and BF16 are supported for q_dtype");
   }
+  int q_stride_s, q_stride_d, q_stride_h, q_stride_b;
+  int k_stride_s, k_stride_d, k_stride_h, k_stride_b;
+  int v_stride_d, v_stride_s, v_stride_h, v_stride_b;
+  int o_stride_s, o_stride_d, o_stride_h, o_stride_b;
+  if (tensor_layout == TENSOR_LAYOUT_HND) {
+    int q_sh = seq_len_q * head_dim;
+    int k_sh = seq_len_kv * head_dim;
+    q_stride_s = head_dim;       q_stride_d = 1;   q_stride_h = q_sh;   q_stride_b = num_heads_q * q_sh;
+    k_stride_s = head_dim;       k_stride_d = 1;   k_stride_h = k_sh;   k_stride_b = num_heads_kv * k_sh;
+    v_stride_d = 1;              v_stride_s = head_dim; v_stride_h = k_sh;   v_stride_b = num_heads_kv * k_sh;
+    o_stride_s = head_dim;       o_stride_d = 1;   o_stride_h = q_sh;   o_stride_b = num_heads_q * q_sh;
+  } else {
+    int q_hd = num_heads_q * head_dim;
+    int k_hd = num_heads_kv * head_dim;
+    q_stride_s = q_hd;           q_stride_d = 1;   q_stride_h = head_dim; q_stride_b = seq_len_q * q_hd;
+    k_stride_s = k_hd;           k_stride_d = 1;   k_stride_h = head_dim; k_stride_b = seq_len_kv * k_hd;
+    v_stride_d = 1;              v_stride_s = k_hd; v_stride_h = head_dim; v_stride_b = seq_len_kv * k_hd;
+    o_stride_s = q_hd;           o_stride_d = 1;   o_stride_h = head_dim; o_stride_b = seq_len_q * q_hd;
+  }
 #ifdef ARK_XPU
   if (use_int8_pv) {
     XpuWrapper::sagev1_pvi8((sycl::queue*)stream, (void*)Q, (void*)K, (void*)V, (void*)O, (void*)mask,
-                            scale_block_size, q_stride_s, q_stride_d, q_stride_h, q_stride_b, k_stride_s,
-                            k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b,
-                            o_stride_s, o_stride_d, o_stride_h, o_stride_b, batch, num_heads_q, num_heads_kv,
-                            seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal, (BTLA_DTYPE)q_dtype);
+                           scale_block_size, q_stride_s, q_stride_d, q_stride_h, q_stride_b, k_stride_s,
+                           k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b,
+                           o_stride_s, o_stride_d, o_stride_h, o_stride_b, batch, num_heads_q, num_heads_kv,
+                           seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal, (BTLA_DTYPE)q_dtype,
+                           (float*)lse);
   } else {
     XpuWrapper::sagev1((sycl::queue*)stream, (void*)Q, (void*)K, (void*)V, (void*)O, (void*)mask, scale_block_size,
-                       q_stride_s, q_stride_d, q_stride_h, q_stride_b, k_stride_s, k_stride_d, k_stride_h,
-                       k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b, o_stride_s, o_stride_d,
-                       o_stride_h, o_stride_b, batch, num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim,
-                       softmax_scale, is_causal, (BTLA_DTYPE)q_dtype);
+                      q_stride_s, q_stride_d, q_stride_h, q_stride_b, k_stride_s, k_stride_d, k_stride_h,
+                      k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b, o_stride_s, o_stride_d,
+                      o_stride_h, o_stride_b, batch, num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim,
+                      softmax_scale, is_causal, (BTLA_DTYPE)q_dtype, (float*)lse, use_mean_bias);
   }
 #else
   throw std::runtime_error("ark::sagev1 is only supported on XPU");
@@ -218,64 +257,92 @@ static void sagev1_impl(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V,
 }
 
 static void sagev1(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                   int scale_block_size, int q_stride_s, int q_stride_d, int q_stride_h, int q_stride_b,
-                   int k_stride_s, int k_stride_d, int k_stride_h, int k_stride_b, int v_stride_d, int v_stride_s,
-                   int v_stride_h, int v_stride_b, int o_stride_s, int o_stride_d, int o_stride_h, int o_stride_b,
-                   int q_dtype, int k_dtype, int v_dtype, int o_dtype, int batch, int num_heads_q, int num_heads_kv,
-                   int seq_len_q, int seq_len_kv, int head_dim, float softmax_scale, bool is_causal) {
-  sagev1_impl(stream, Q, K, V, O, mask, scale_block_size, q_stride_s, q_stride_d, q_stride_h, q_stride_b,
-              k_stride_s, k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b,
-              o_stride_s, o_stride_d, o_stride_h, o_stride_b, q_dtype, k_dtype, v_dtype, o_dtype, batch,
-              num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal, false);
+                  int scale_block_size, int q_dtype, int k_dtype, int v_dtype, int o_dtype, int batch,
+                  int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
+                  float softmax_scale, bool is_causal, int tensor_layout, bool use_mean_bias,
+                  torch_ptr lse = 0) {
+  sagev1_impl(stream, Q, K, V, O, mask, scale_block_size, q_dtype, k_dtype, v_dtype, o_dtype, batch, num_heads_q,
+              num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal, false, tensor_layout,
+              use_mean_bias, lse);
 }
 
 static void sagev1_pvi8(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                        int scale_block_size, int q_stride_s, int q_stride_d, int q_stride_h, int q_stride_b,
-                        int k_stride_s, int k_stride_d, int k_stride_h, int k_stride_b, int v_stride_d,
-                        int v_stride_s, int v_stride_h, int v_stride_b, int o_stride_s, int o_stride_d,
-                        int o_stride_h, int o_stride_b, int q_dtype, int k_dtype, int v_dtype, int o_dtype,
-                        int batch, int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
-                        float softmax_scale, bool is_causal) {
-  sagev1_impl(stream, Q, K, V, O, mask, scale_block_size, q_stride_s, q_stride_d, q_stride_h, q_stride_b,
-              k_stride_s, k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b,
-              o_stride_s, o_stride_d, o_stride_h, o_stride_b, q_dtype, k_dtype, v_dtype, o_dtype, batch,
-              num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal, true);
+                       int scale_block_size, int q_dtype, int k_dtype, int v_dtype, int o_dtype, int batch,
+                       int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
+                       float softmax_scale, bool is_causal, int tensor_layout, bool use_mean_bias,
+                       torch_ptr lse = 0) {
+  sagev1_impl(stream, Q, K, V, O, mask, scale_block_size, q_dtype, k_dtype, v_dtype, o_dtype, batch, num_heads_q,
+              num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal, true, tensor_layout,
+              use_mean_bias, lse);
 }
 
 static void sage(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                 int scale_block_size, torch_ptr qscale, torch_ptr kscale, int q_stride_s, int q_stride_d,
-                 int q_stride_h, int q_stride_b, int k_stride_s, int k_stride_d, int k_stride_h, int k_stride_b,
-                 int v_stride_d, int v_stride_s, int v_stride_h, int v_stride_b, int o_stride_s, int o_stride_d,
-                 int o_stride_h, int o_stride_b, int q_dtype, int k_dtype, int o_dtype, int batch, int num_heads_q,
-                 int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim, float softmax_scale,
-                 bool is_causal) {
+                 int scale_block_size, torch_ptr qscale, torch_ptr kscale, int q_dtype, int k_dtype, int o_dtype,
+                 int batch, int num_heads_q, int num_heads_kv, int seq_len_q, int seq_len_kv, int head_dim,
+                 float softmax_scale, bool is_causal, int tensor_layout, torch_ptr lse = 0) {
   if (mask && is_causal) {
-    throw std::invalid_argument("ark::sagev1: mask and is_causal cannot both be set");
+    throw std::invalid_argument("ark::sage: mask and is_causal cannot both be set");
+  }
+  int q_stride_s, q_stride_d, q_stride_h, q_stride_b;
+  int k_stride_s, k_stride_d, k_stride_h, k_stride_b;
+  int v_stride_d, v_stride_s, v_stride_h, v_stride_b;
+  int o_stride_s, o_stride_d, o_stride_h, o_stride_b;
+  if (tensor_layout == TENSOR_LAYOUT_HND) {
+    int q_sh = seq_len_q * head_dim;
+    int k_sh = seq_len_kv * head_dim;
+    q_stride_s = head_dim;       q_stride_d = 1;   q_stride_h = q_sh;   q_stride_b = num_heads_q * q_sh;
+    k_stride_s = head_dim;       k_stride_d = 1;   k_stride_h = k_sh;   k_stride_b = num_heads_kv * k_sh;
+    v_stride_d = 1;              v_stride_s = head_dim; v_stride_h = k_sh;   v_stride_b = num_heads_kv * k_sh;
+    o_stride_s = head_dim;       o_stride_d = 1;   o_stride_h = q_sh;   o_stride_b = num_heads_q * q_sh;
+  } else {
+    int q_hd = num_heads_q * head_dim;
+    int k_hd = num_heads_kv * head_dim;
+    q_stride_s = q_hd;           q_stride_d = 1;   q_stride_h = head_dim; q_stride_b = seq_len_q * q_hd;
+    k_stride_s = k_hd;           k_stride_d = 1;   k_stride_h = head_dim; k_stride_b = seq_len_kv * k_hd;
+    v_stride_d = 1;              v_stride_s = k_hd; v_stride_h = head_dim; v_stride_b = seq_len_kv * k_hd;
+    o_stride_s = q_hd;           o_stride_d = 1;   o_stride_h = head_dim; o_stride_b = seq_len_q * q_hd;
   }
   ark::sdpa_impl_qks8_pvhalf((sycl::queue*)stream, (void*)Q, (void*)K, (void*)V, (void*)O, (void*)mask,
-                             scale_block_size, (void*)qscale, (void*)kscale, q_stride_s, q_stride_d, q_stride_h,
-                             q_stride_b, k_stride_s, k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s,
-                             v_stride_h, v_stride_b, o_stride_s, o_stride_d, o_stride_h, o_stride_b, batch,
-                             num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal,
-                             (BTLA_DTYPE)o_dtype);
+                            scale_block_size, (void*)qscale, (void*)kscale, q_stride_s, q_stride_d, q_stride_h,
+                            q_stride_b, k_stride_s, k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s,
+                            v_stride_h, v_stride_b, o_stride_s, o_stride_d, o_stride_h, o_stride_b, batch,
+                            num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale, is_causal,
+                            (BTLA_DTYPE)o_dtype, (float*)lse);
 }
 
 static void sage_pvi8(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                      int scale_block_size, torch_ptr qscale, torch_ptr kscale, torch_ptr vscale, int q_stride_s,
-                      int q_stride_d, int q_stride_h, int q_stride_b, int k_stride_s, int k_stride_d,
-                      int k_stride_h, int k_stride_b, int v_stride_d, int v_stride_s, int v_stride_h,
-                      int v_stride_b, int o_stride_s, int o_stride_d, int o_stride_h, int o_stride_b, int q_dtype,
-                      int k_dtype, int o_dtype, int batch, int num_heads_q, int num_heads_kv, int seq_len_q,
-                      int seq_len_kv, int head_dim, float softmax_scale, bool is_causal) {
+                     int scale_block_size, torch_ptr qscale, torch_ptr kscale, torch_ptr vscale, int q_dtype,
+                     int k_dtype, int o_dtype, int batch, int num_heads_q, int num_heads_kv, int seq_len_q,
+                     int seq_len_kv, int head_dim, float softmax_scale, bool is_causal, int tensor_layout,
+                     torch_ptr lse = 0) {
   if (mask && is_causal) {
     throw std::invalid_argument("ark::sage_pvi8: mask and is_causal cannot both be set");
   }
+  int q_stride_s, q_stride_d, q_stride_h, q_stride_b;
+  int k_stride_s, k_stride_d, k_stride_h, k_stride_b;
+  int v_stride_d, v_stride_s, v_stride_h, v_stride_b;
+  int o_stride_s, o_stride_d, o_stride_h, o_stride_b;
+  if (tensor_layout == TENSOR_LAYOUT_HND) {
+    int q_sh = seq_len_q * head_dim;
+    int k_sh = seq_len_kv * head_dim;
+    q_stride_s = head_dim;       q_stride_d = 1;   q_stride_h = q_sh;   q_stride_b = num_heads_q * q_sh;
+    k_stride_s = head_dim;       k_stride_d = 1;   k_stride_h = k_sh;   k_stride_b = num_heads_kv * k_sh;
+    v_stride_d = 1;              v_stride_s = head_dim; v_stride_h = k_sh;   v_stride_b = num_heads_kv * k_sh;
+    o_stride_s = head_dim;       o_stride_d = 1;   o_stride_h = q_sh;   o_stride_b = num_heads_q * q_sh;
+  } else {
+    int q_hd = num_heads_q * head_dim;
+    int k_hd = num_heads_kv * head_dim;
+    q_stride_s = q_hd;           q_stride_d = 1;   q_stride_h = head_dim; q_stride_b = seq_len_q * q_hd;
+    k_stride_s = k_hd;           k_stride_d = 1;   k_stride_h = head_dim; k_stride_b = seq_len_kv * k_hd;
+    v_stride_d = 1;              v_stride_s = k_hd; v_stride_h = head_dim; v_stride_b = seq_len_kv * k_hd;
+    o_stride_s = q_hd;           o_stride_d = 1;   o_stride_h = head_dim; o_stride_b = seq_len_q * q_hd;
+  }
   ark::sdpa_impl_qks8_pvi8((sycl::queue*)stream, (void*)Q, (void*)K, (void*)V, (void*)O, (void*)mask,
-                           scale_block_size, (void*)qscale, (void*)kscale, (void*)vscale, q_stride_s, q_stride_d,
-                           q_stride_h, q_stride_b, k_stride_s, k_stride_d, k_stride_h, k_stride_b, v_stride_d,
-                           v_stride_s, v_stride_h, v_stride_b, o_stride_s, o_stride_d, o_stride_h, o_stride_b,
-                           batch, num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale,
-                           is_causal, (BTLA_DTYPE)o_dtype);
+                          scale_block_size, (void*)qscale, (void*)kscale, (void*)vscale, q_stride_s, q_stride_d,
+                          q_stride_h, q_stride_b, k_stride_s, k_stride_d, k_stride_h, k_stride_b, v_stride_d,
+                          v_stride_s, v_stride_h, v_stride_b, o_stride_s, o_stride_d, o_stride_h, o_stride_b,
+                          batch, num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale,
+                          is_causal, (BTLA_DTYPE)o_dtype, (float*)lse);
 }
 
 static void moe_gemm_wrapper(torch_ptr stream, torch_ptr activations, torch_ptr weights, torch_ptr scales,
@@ -690,6 +757,8 @@ static ark::cpu::attn_fwd_args_t make_bestla_attn_args(const CpuSdpaRequest& req
   return args;
 }
 
+static void dispatch_mixed_raw(const CpuSdpaRequest& req);
+
 static CpuSdpaRoute select_cpu_sdpa_route(const CpuSdpaRequest& req) {
   if (req.mixed_dtype()) {
     return CpuSdpaRoute::MixedRaw;
@@ -719,14 +788,21 @@ static bool can_dispatch_homogeneous_fp16(const CpuSdpaRequest& req) {
   const bool gqa_ok = req.num_heads_kv > 0 && req.num_heads_q > 0 && (req.num_heads_q % req.num_heads_kv) == 0;
   const bool causal_shape_ok = !req.is_causal || req.seq_len_q <= req.seq_len_kv;
   const bool v_plain_ok = req.v_stride_d == 1;
-  return cpu->AVX512_FP16() && gqa_ok && causal_shape_ok && v_plain_ok && ark::CpuWrapper::get_threading() != nullptr;
+  if (!gqa_ok || !causal_shape_ok || !v_plain_ok || req.mask || ark::CpuWrapper::get_threading() == nullptr) {
+    return false;
+  }
+  return cpu->AVX512_FP16();
 #endif
 }
 
 static void dispatch_homogeneous_fp16(const CpuSdpaRequest& req) {
+#if CompileFP16()
+  if (!bestla::device::CpuDevice::getInstance()->AVX512_FP16()) {
+    throw std::runtime_error("ark::sdpa: homogeneous fp16 route requires AVX512-FP16 at runtime");
+  }
   std::vector<uint16_t> transposed_k = transpose_plain_half_k_for_homogeneous_fp16(
-      req.K, req.k_stride_s, req.k_stride_d, req.k_stride_h, req.k_stride_b, req.batch, req.num_heads_kv,
-      req.seq_len_kv, req.head_dim);
+      req.K, req.k_stride_s, req.k_stride_d, req.k_stride_h, req.k_stride_b, req.batch, req.num_heads_kv, req.seq_len_kv,
+      req.head_dim);
   auto hargs = make_bestla_attn_args(req);
   hargs.K = transposed_k.data();
   hargs.step_k_bs = req.num_heads_kv * req.head_dim * req.seq_len_kv;
@@ -737,6 +813,10 @@ static void dispatch_homogeneous_fp16(const CpuSdpaRequest& req) {
     throw std::runtime_error("ark::sdpa: CPU threading handle is unavailable for the homogeneous fp16 route");
   }
   ark::cpu::bestla_sdpa_forward_homogeneous(hargs, BTLA_DTYPE::F16);
+#else
+  (void)req;
+  throw std::runtime_error("ark::sdpa: homogeneous fp16 route was not compiled into this build");
+#endif
 }
 
 static bool can_dispatch_homogeneous_bf16(const CpuSdpaRequest& req) {
@@ -749,7 +829,7 @@ static bool can_dispatch_homogeneous_bf16(const CpuSdpaRequest& req) {
   const bool causal_shape_ok = !req.is_causal || req.seq_len_q <= req.seq_len_kv;
   const bool k_plain_ok = req.k_stride_d == 1;
   const bool v_plain_ok = req.v_stride_d == 1;
-  return cpu->AMX_BF16() && no_gqa && causal_shape_ok && k_plain_ok && v_plain_ok &&
+ return cpu->AMX_BF16() && no_gqa && causal_shape_ok && k_plain_ok && v_plain_ok && !req.mask &&
          ark::CpuWrapper::get_threading() != nullptr;
  #endif
 }
@@ -914,32 +994,6 @@ static void sdpa(torch_ptr stream, torch_ptr Q, torch_ptr K, torch_ptr V, torch_
      dispatch_scalar(req);
      return;
   }
-}
-
-// Debug-only: call the raw Route 4 kernel directly (bypassing the
-// mha_dense_forward mitigation) with NaN instrumentation enabled via
-// ARK_DEBUG_ROUTE4_NAN=1. Returns 0 on success, throws on error.
-static int ark_cpu_debug_route4_raw(torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
-                                    int q_stride_s, int q_stride_d, int q_stride_h, int q_stride_b,
-                                    int k_stride_s, int k_stride_d, int k_stride_h, int k_stride_b,
-                                    int v_stride_d, int v_stride_s, int v_stride_h, int v_stride_b,
-                                    int o_stride_s, int o_stride_d, int o_stride_h, int o_stride_b, int q_dtype,
-                                    int k_dtype, int o_dtype, int batch, int num_heads_q, int num_heads_kv,
-                                    int seq_len_q, int seq_len_kv, int head_dim, float softmax_scale,
-                                    bool is_causal, bool use_alibi, bool use_tanh, bool prefer_fp32_flag,
-                                    py::object n_padding_arg) {
-  std::vector<int> n_padding_storage = parse_batch_n_padding(n_padding_arg, batch, "ark_cpu_debug_route4_raw");
-  const CpuSdpaRequest req{
-      Q,           K,        V,    O,    mask,         q_stride_s, q_stride_d, q_stride_h, q_stride_b,
-      k_stride_s,  k_stride_d, k_stride_h, k_stride_b, v_stride_d, v_stride_s, v_stride_h, v_stride_b,
-      o_stride_s,  o_stride_d, o_stride_h, o_stride_b, static_cast<BTLA_DTYPE>(q_dtype),
-      static_cast<BTLA_DTYPE>(k_dtype), static_cast<BTLA_DTYPE>(o_dtype), batch,
-      num_heads_q, num_heads_kv, seq_len_q, seq_len_kv, head_dim, softmax_scale,
-      is_causal,   use_alibi,  use_tanh, prefer_fp32_flag, n_padding_storage,
-  };
-  auto hargs = make_bestla_attn_args(req);
-  ark::cpu::debug_bestla_sdpa_forward_route4_raw(hargs);
-  return 0;
 }
 
 static int ark_cpu_debug_resolve_sdpa_route(torch_ptr Q, torch_ptr K, torch_ptr V, torch_ptr O, torch_ptr mask,
@@ -1284,7 +1338,6 @@ PYBIND11_MODULE(PY_NAME, m) {
   m.attr("ARK_CPU_SDPA_BUILD_HAS_FP16_ROUTE") = pybind11::bool_(CompileFP16());
   m.attr("ARK_CPU_SDPA_BUILD_HAS_BF16_ROUTE") = pybind11::bool_(CompileBF16());
   m.def("ark_cpu_debug_resolve_sdpa_route", &ark::ark_cpu_debug_resolve_sdpa_route);
-  m.def("ark_cpu_debug_route4_raw", &ark::ark_cpu_debug_route4_raw);
   m.def("ark_cpu_kv_update", &ark::ark_cpu_kv_update);
   m.def("ark_cpu_packed_kv_descriptor", &ark::ark_cpu_packed_kv_descriptor);
   m.def("ark_cpu_packed_kv_elems", &ark::ark_cpu_packed_kv_elems);
