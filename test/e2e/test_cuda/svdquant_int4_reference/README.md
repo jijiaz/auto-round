@@ -107,7 +107,9 @@ group-32 control, lower is better):
 | K-axis 64 | 64 | 0.68 | pass |
 | K-axis 128 | 128 | 0.80 | pass |
 | K-axis 256 | 256 | 0.93 | pass |
-| K-axis per-channel (3072+) | >= 3072 | 1.22 | fail |
+| K-axis 512 | 512 | 1.03 | fail (marginal) |
+| K-axis 1024 | 1024 | 1.26 | fail |
+| K-axis per-channel | >= 768 (full row) | 1.22 | fail |
 | Block 16x16 | 256 | 1.02 | fail (marginal) |
 | Block 16x32 | 512 | 1.18 | fail |
 | Block 32x32 | 1024 | 1.34 | fail |
@@ -123,17 +125,30 @@ Two conclusions drive the rest of the study:
    control. Rows of a DiT projection have very different dynamic ranges, so a
    block that spans 16 output channels pays for the widest row in the tile.
    A 2-D block contract is therefore not recommended for INT4 SVDQuant.
-2. **The weight boundary sits between K = 256 and per-output-channel.**
-   K = 256 is still slightly better than the MXFP4 control; per-channel is
-   clearly worse.
+2. **The weight boundary sits between K = 256 and K = 512.** K = 256 is still
+   slightly better than the MXFP4 control (0.93x); K = 512 is the first clear
+   failure (1.03x) and everything above it degrades monotonically.
 
-Activation scan (weight block fixed at K = 64, W4A4, versus the W4A4 MXFP4
-group-32 control) shows that dynamic INT4 activations, not weights, dominate
-the error: every scanned activation group (16, 32, 64, 128, per-token) is worse
-than the MXFP4 W4A4 control at its own group size, with the gap growing
-monotonically with the group. If a W4A4 product path is required, the
-activation group must be kept at or below the MXFP4 control's 32 and re-checked
-at model level; a W4A16 INT4 path is much more comfortable.
+Two independent seeds agree to within 1% on every configuration, so the
+ordering and the location of the boundary are stable screening results.
+
+Activation scan (weight block fixed at K = 64, W4A4, screened against a *W4A4*
+MXFP4 group-32 control, since the published MXFP4 SVDQuant configuration also
+quantizes activations):
+
+| Activation group | NMSE ratio vs MXFP4 g32 W4A4 | Screening |
+|---|---:|---|
+| 16 | 0.52 | pass |
+| 32 | 0.60 | pass |
+| 64 | 0.68 | pass |
+| 128 | 0.76 | pass |
+| per-token | 1.03 | fail (marginal) |
+
+Activation quantization raises the absolute error by roughly 3x relative to
+W4A16 (2.0e-2 versus 7.0e-3 for the controls), but INT4 activations are
+*relatively* better than MXFP4 activations at every group size up to 128. The
+activation boundary is therefore also between 128 and per-token, and W4A4
+remains the higher-risk path only in absolute terms.
 
 ## Steps 3 and 5: controls and the model-level sweep
 
@@ -202,14 +217,16 @@ Screening evidence (Step 4), pending the model-level confirmation of Step 5:
   below the screened boundary at K = 256, and 128 is the standard tile-friendly
   K granularity for INT4 GEMM kernels. K = 64 (0.68x) is the conservative
   fallback if the model-level run at 128 is marginal.
-* **Screened upper bound: K = 256**; the first clear failure is a single scale
-  per output channel. Step 5 should evaluate 128 and 256 (plus 64 as the
-  smaller control) and, if a 2-D contract is still under consideration, 16x16.
+* **Screened upper bound: K = 256**; K = 512 is the first failure. Step 5 should
+  evaluate 256 and 512 (plus 128 as the smaller control) and, if a 2-D contract
+  is still under consideration, 16x16.
 * **2-D M-by-K block scaling is not recommended**: at equal metadata cost it is
   strictly worse than K-axis grouping, and even 16x16 already screens as a
   marginal failure.
-* **W4A4 is the risk, not W4A16**: activation quantization dominates the error
-  in every configuration scanned.
+* **W4A4**: dynamic INT4 activations with a group of 128 or smaller screen
+  better than the matching MXFP4 W4A4 control; per-token activation scales do
+  not. Activations still contribute ~3x more absolute error than weights, so
+  the W4A4 boundary must be confirmed at model level before it is promised.
 
 ## Step 7: go/no-go inputs
 
