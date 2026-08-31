@@ -126,10 +126,12 @@ def _effective_weight(weight: torch.Tensor, block, *, rank: int, iters: int, dat
     return quantized_residual + low_rank
 
 
-def _activation_qdq(activation: torch.Tensor, act_group_size: int) -> torch.Tensor:
-    from auto_round.data_type.int import quant_tensor_sym
+def _activation_qdq(activation: torch.Tensor, act_group_size: int, data_type: str = "int") -> torch.Tensor:
+    """Dynamic per-token 4-bit activation QDQ, using the same registry as the runtime path."""
+    from auto_round.data_type.utils import get_quant_func
 
-    qdq, _, _ = quant_tensor_sym(activation, bits=4, group_size=act_group_size)
+    quant_func, resolved = get_quant_func(data_type, 4, True, disable_opt_rtn=True, group_size=act_group_size, iters=0)
+    qdq, _, _ = quant_func(activation, bits=4, group_size=act_group_size, data_type=resolved)
     return qdq
 
 
@@ -146,7 +148,7 @@ def layer_nmse(
     """Relative output error ``||W_eff x - W x||^2 / ||W x||^2`` for one layer."""
     effective = _effective_weight(weight, block, rank=rank, iters=iters, data_type=data_type)
     reference = activation @ weight.t()
-    quant_input = activation if act_group_size is None else _activation_qdq(activation, act_group_size)
+    quant_input = activation if act_group_size is None else _activation_qdq(activation, act_group_size, data_type)
     approx = quant_input @ effective.t()
     return (approx - reference).square().sum().item() / reference.square().sum().item()
 
@@ -170,6 +172,9 @@ def run_sweep(args) -> dict:
         ]
         configs += [(f"int4_{block}", block, "int", None) for block in weight_blocks]
         if args.scan_activations:
+            # W4A4 candidates are screened against a W4A4 control, because the published
+            # MXFP4 SVDQuant configuration also quantizes activations to 4 bits.
+            configs += [("mxfp4_g32_a32_control", 32, MXFP4_CONTROL, 32)]
             configs += [
                 (f"int4_w{args.act_weight_block}_a{act}", args.act_weight_block, "int", act)
                 for act in ACT_GROUP_CANDIDATES
@@ -225,16 +230,21 @@ def summarize(records: list[dict]) -> dict:
     for record in records:
         by_config.setdefault(record["config"], []).append(record["nmse"])
 
-    control = by_config.get("mxfp4_g32_control")
-    control_gmean = _gmean(control) if control else None
+    w4a16_control = by_config.get("mxfp4_g32_control")
+    w4a4_control = by_config.get("mxfp4_g32_a32_control")
+    w4a16_gmean = _gmean(w4a16_control) if w4a16_control else None
+    w4a4_gmean = _gmean(w4a4_control) if w4a4_control else None
+    act_configs = {record["config"] for record in records if record["act_group_size"] is not None}
 
     summary = {}
     for config, values in by_config.items():
         gmean = _gmean(values)
+        control_gmean = w4a4_gmean if config in act_configs else w4a16_gmean
         summary[config] = {
             "geomean_nmse": gmean,
             "max_nmse": max(values),
             "layers": len(values),
+            "control": "mxfp4_g32_a32_control" if config in act_configs else "mxfp4_g32_control",
             "ratio_vs_mxfp4_control": (gmean / control_gmean) if control_gmean else None,
             "screening_pass": (gmean <= control_gmean) if control_gmean else None,
         }
@@ -266,10 +276,12 @@ def main(argv=None) -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2))
     print(f"\nwrote {args.output}")
-    control = result["summary"].get("mxfp4_g32_control", {}).get("geomean_nmse")
-    print(f"MXFP4 group-32 control geomean NMSE: {control:.6e}")
+    for control_name in ("mxfp4_g32_control", "mxfp4_g32_a32_control"):
+        control = result["summary"].get(control_name, {}).get("geomean_nmse")
+        if control is not None:
+            print(f"{control_name} geomean NMSE: {control:.6e}")
     for config, stats in sorted(result["summary"].items()):
-        if config == "mxfp4_g32_control":
+        if config.endswith("_control"):
             continue
         verdict = "PASS" if stats["screening_pass"] else "fail"
         print(f"{config:>24} geomean={stats['geomean_nmse']:.6e} ratio={stats['ratio_vs_mxfp4_control']:.3f} {verdict}")

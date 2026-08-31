@@ -113,7 +113,7 @@ HISTORICAL_REFERENCE: dict[str, dict[str, float]] = {
 # Candidate block sizes
 # ---------------------------------------------------------------------------
 # K-axis candidates with a per-row scale (M = 1). ``-1`` means per-output-channel.
-K_AXIS_CANDIDATES: tuple[int, ...] = (16, 32, 64, 128, 256, -1)
+K_AXIS_CANDIDATES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024, -1)
 
 # Two-dimensional (M, K) candidates for a block-scaled kernel contract.
 BLOCK_CANDIDATES: tuple[tuple[int, int], ...] = (
