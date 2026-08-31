@@ -131,7 +131,7 @@ def quant_tensor_rtn_sym(
     min_scale=1.0,
     max_scale=1.0,
     scale_dtype=torch.float16,
-    **kwargs
+    **kwargs,
 ):
     """Quantize and de-quantize tensor asymmetrically. full range, credit goes to llamacpp community
 
@@ -175,7 +175,7 @@ def quant_tensor_sym(
     tensor_max=None,
     q_scale_thresh=1e-5,
     init_scale=None,
-    **kwargs
+    **kwargs,
 ):
     """Quantize and de-quantize tensor asymmetrically. full range, credit goes to llamacpp community
 
@@ -250,7 +250,7 @@ def quant_block_tensor_sym(
     tensor_min=None,
     tensor_max=None,
     q_scale_thresh=1e-5,
-    **kwargs
+    **kwargs,
 ):
     """Symmetric integer QDQ with one scale shared by an M-by-K block of weights.
 
@@ -321,7 +321,7 @@ def quant_tensor_asym(
     tensor_min=None,
     tensor_max=None,
     q_scale_thresh=1e-5,
-    **kwargs
+    **kwargs,
 ):
     """Quantize and de-quantize tensor asymmetrically.
 
@@ -381,7 +381,7 @@ def quant_tensor_sym_gptq(
     tensor_min=None,
     tensor_max=None,
     q_scale_thresh=1e-5,
-    **kwargs
+    **kwargs,
 ):
     """Quantize and de-quantize tensor asymmetrically.
 
@@ -447,7 +447,7 @@ def quant_tensor_asym_wo_round(
     tensor_min=None,
     tensor_max=None,
     q_scale_thresh=1e-5,
-    **kwargs
+    **kwargs,
 ):
     """Quantize and de-quantize tensor asymmetrically without rounding, this is mainly for tuning bias, norm.
 
