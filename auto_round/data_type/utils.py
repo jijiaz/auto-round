@@ -133,6 +133,23 @@ def get_quant_func(
     def pad_bits(data_type):
         return data_type + str(bits)
 
+    if group_size is not None and isinstance(group_size, tuple):
+        # Block (M-by-K) scaling has its own registered implementations; resolve them before
+        # the rtn/opt_rtn aliases, whose K-axis semantics do not match a 2D block contract.
+        block_data_type = "block_" + dtype
+        data_types = [
+            block_data_type,
+            pad_bits(block_data_type),
+            pad_sym(block_data_type),
+            pad_sym(pad_bits(block_data_type)),
+        ]
+
+        from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
+
+        for data_type in data_types:
+            if data_type in QUANT_FUNC_WITH_DTYPE:
+                return QUANT_FUNC_WITH_DTYPE[data_type], data_type
+
     if not disable_opt_rtn and iters == 0:
         rtn_data_type = "opt_rtn_" + dtype
         data_types = [rtn_data_type, pad_bits(rtn_data_type), pad_sym(rtn_data_type), pad_sym(pad_bits(rtn_data_type))]
@@ -147,21 +164,6 @@ def get_quant_func(
         for data_type in data_types:
             from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
 
-            if data_type in QUANT_FUNC_WITH_DTYPE:
-                return QUANT_FUNC_WITH_DTYPE[data_type], data_type
-
-    if group_size is not None and isinstance(group_size, tuple):
-        block_data_type = "block_" + dtype
-        data_types = [
-            block_data_type,
-            pad_bits(block_data_type),
-            pad_sym(block_data_type),
-            pad_sym(pad_bits(block_data_type)),
-        ]
-
-        from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
-
-        for data_type in data_types:
             if data_type in QUANT_FUNC_WITH_DTYPE:
                 return QUANT_FUNC_WITH_DTYPE[data_type], data_type
 

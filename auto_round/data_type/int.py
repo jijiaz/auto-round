@@ -238,6 +238,77 @@ def quant_tensor_sym(
     return qdq_result, scale, maxq
 
 
+@register_dtype(("block_int_sym", "block_int4_sym"))
+def quant_block_tensor_sym(
+    tensor,
+    bits=4,
+    group_size=(128, 128),
+    v=0,
+    min_scale=1.0,
+    max_scale=1.0,
+    scale_dtype=torch.float16,
+    tensor_min=None,
+    tensor_max=None,
+    q_scale_thresh=1e-5,
+    **kwargs
+):
+    """Symmetric integer QDQ with one scale shared by an M-by-K block of weights.
+
+    This is the two-dimensional counterpart of :func:`quant_tensor_sym`: instead of one
+    scale per K-axis group of a row, one scale is shared by an ``(M, K)`` tile, which is
+    the layout used by block-scaled INT kernels (and by the SVDQuant INT4 reference
+    study). Semantics otherwise match ``int_sym``: full-range symmetric codes in
+    ``[-2**(bits-1), 2**(bits-1) - 1]``, ``scale = max_abs / 2**(bits-1)`` materialized in
+    ``scale_dtype``, round-half-to-even before clamping, and zero padding for partial
+    blocks (padding never widens a block range and is cropped from the result).
+
+    Args:
+        tensor: Tensor containing the tensor to be quantized
+        bits: Number of bits for quantization (e.g., 2, 3, 4, 8)
+        group_size: ``(M, K)`` block shape sharing one scale
+        v: Rounding value perturbation
+        min_scale: Minimum scale coefficient for tensor
+        max_scale: Maximum scale coefficient for tensor
+        tensor_min (Tensor, optional): Minimum block value for quantization. Defaults to None.
+        tensor_max (Tensor, optional): Maximum block value for quantization. Defaults to None.
+        scale_dtype: dtype of the quantized scale, as most kernels only support FP16 or FP32
+        q_scale_thresh: clip the quantized scale's magnitude to this value to improve the numerical stability
+
+    Returns:
+        Quantized and de-quantized tensor, scale, maxq
+    """
+    if not (isinstance(group_size, tuple) and len(group_size) == 2):
+        raise ValueError(f"block_int_sym requires a 2D `(M, K)` group_size, got {group_size!r}")
+    if tensor.ndim != 2:
+        raise ValueError(f"block_int_sym requires a 2D tensor, got shape {tuple(tensor.shape)}")
+
+    orig_dtype = tensor.dtype
+    tensor, orig_shape, pad_len = reshape_pad_tensor_by_group_size(tensor, group_size)
+    maxq = int(2.0 ** (bits - 1))
+
+    if tensor_min is None or tensor_max is None:
+        wmin_tmp = torch.clamp(tensor.amin(dim=(-2, -1)), max=0)
+        wmax_tmp = torch.clamp(tensor.amax(dim=(-2, -1)), min=0)
+    else:
+        wmin_tmp = tensor_min
+        wmax_tmp = tensor_max
+        if isinstance(wmin_tmp, torch.Tensor):
+            wmin_tmp = wmin_tmp.to(tensor.device)
+            wmax_tmp = wmax_tmp.to(tensor.device)
+
+    wmin_abs = -(wmin_tmp * min_scale)  # pylint: disable=E1130
+    wmax_abs = wmax_tmp * max_scale
+    max_v = (2 * (wmax_abs < wmin_abs).int() - 1) * torch.max(wmax_abs, wmin_abs)
+    scale = (max_v / maxq).to(scale_dtype)
+    scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
+    scale = scale.unsqueeze(dim=-1).unsqueeze(dim=-1)
+    int_w = round_ste(tensor / scale + v)
+    q = torch.clamp(int_w, -maxq, maxq - 1)
+    qdq_result = (scale * q).to(orig_dtype)
+    qdq_result = revert_tensor_by_pad(qdq_result, orig_shape=orig_shape, pad_len=pad_len)
+    return qdq_result, scale.squeeze(-1).squeeze(-1), maxq
+
+
 @register_dtype("int_asym")
 def quant_tensor_asym(
     tensor,
