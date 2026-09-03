@@ -196,6 +196,34 @@ if(ARK_XPU AND ARK_SYCL_TLA)
 endif()
 target_link_libraries(${PY_NAME} PRIVATE ${libs})
 
+# SVDQuant Kernel A must reproduce the PyTorch MXFP4 oracle bit-for-bit, and
+# icpx defaults to -fp-model=fast. Reassociation there would let the compiler
+# collapse the Markstein division correction in sycl_svdquant_mxfp4.hpp back
+# into a plain (approximate) fdiv, and would relax the transcendentals the
+# shared-exponent path depends on. This translation unit therefore opts out.
+#
+# The correctly-rounded FP32 divide cannot be obtained with a flag here:
+# -foffload-fp32-prec-div only takes effect in the offload backend, which runs
+# at final link and would therefore apply to every kernel in the module. The
+# division is corrected in-kernel instead. See design doc section 3.3.1.
+#
+# svdquant_mxfp4_cute_kernel.cpp carries the same requirement: since the
+# projection was fused into the quantization kernel it contains the encoding
+# path too, and it reuses the very same load_smoothed / encode_group /
+# store_group from sycl_svdquant_mxfp4.hpp. Leaving it on the default fast model
+# would let the two translation units disagree on values that are supposed to be
+# bit-identical.
+if(ARK_XPU)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/svdquant_mxfp4_kernel.cpp
+    PROPERTIES COMPILE_OPTIONS "-fp-model=precise")
+  if(ARK_SYCL_TLA)
+    set_source_files_properties(
+      ${CMAKE_CURRENT_SOURCE_DIR}/svdquant_mxfp4_cute_kernel.cpp
+      PROPERTIES COMPILE_OPTIONS "-fp-model=precise")
+  endif()
+endif()
+
 if(ARK_UT)
     set(TEST_NAME test_${ARK_TYPE})
     set(TEST_SRCS wrapper/test/test_main.cpp)

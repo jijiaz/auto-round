@@ -30,6 +30,7 @@ typedef uintptr_t torch_ptr;
 #if ARK_SYCL_TLA
 #include "sycl_tla_common.hpp"
 #endif
+#include "sycl_svdquant_mxfp4.hpp"
 #else
 #include "ark/cpu/sdpa.h"
 #include "cpu_wrapper.hpp"
@@ -1313,6 +1314,22 @@ static void ark_cpu_bestla_sdpa_packed(torch_ptr Q, torch_ptr K_packed, torch_pt
 
 #endif  // ARK_XPU && ARK_SYCL_TLA
 
+#ifdef ARK_XPU
+// SVDQuant MXFP4 Kernel A. See wrapper/include/sycl_svdquant_mxfp4.hpp and
+// design doc section 3.3.1 for the numerical contract.
+static void svdquant_mxfp4_quant_down(torch_ptr stream, torch_ptr x, torch_ptr smooth, torch_ptr lora_down,
+                                      torch_ptr qact, torch_ptr ascales, torch_ptr lora_act, torch_ptr workspace, int m,
+                                      int k, int r, int x_dtype, int lora_dtype) {
+  ark::svdquant::quant_down((void*)stream, (const void*)x, (const void*)smooth, (const void*)lora_down, (void*)qact,
+                            (void*)ascales, (void*)lora_act, (void*)workspace, m, k, r, x_dtype, lora_dtype);
+}
+
+// Lets Python size the DPAS scratch without knowing the packed layout.
+static int64_t svdquant_mxfp4_workspace_elements(int m, int k, int r) {
+  return static_cast<int64_t>(ark::svdquant::svdquant_workspace_elements(m, k, r));
+}
+#endif  // ARK_XPU
+
 }  // namespace ark
 
 PYBIND11_MODULE(PY_NAME, m) {
@@ -1394,6 +1411,14 @@ PYBIND11_MODULE(PY_NAME, m) {
   m.def("moe_gemm_prefill_int_dpas", &ark::moe_gemm_prefill_int_dpas_wrapper);
   m.def("matmul_sycl_tla", &ark::matmul_sycl_tla);
 #endif  // ARK_SYCL_TLA
+#ifdef ARK_XPU
+  m.def("svdquant_mxfp4_quant_down", &ark::svdquant_mxfp4_quant_down, pybind11::arg("stream"), pybind11::arg("x"),
+        pybind11::arg("smooth"), pybind11::arg("lora_down"), pybind11::arg("qact"), pybind11::arg("ascales"),
+        pybind11::arg("lora_act"), pybind11::arg("workspace"), pybind11::arg("m"), pybind11::arg("k"),
+        pybind11::arg("r"), pybind11::arg("x_dtype"), pybind11::arg("lora_dtype"));
+  m.def("svdquant_mxfp4_workspace_elements", &ark::svdquant_mxfp4_workspace_elements, pybind11::arg("m"),
+        pybind11::arg("k"), pybind11::arg("r"));
+#endif  // ARK_XPU
 #if !defined(ARK_XPU)
   pybind11::class_<ark::cpu::ReorderKVShape>(m, "ArkCpuPackedKVDescriptor")
       .def(pybind11::init<>())
