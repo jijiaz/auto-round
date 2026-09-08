@@ -267,5 +267,43 @@ void quant_down(void* stream, const void* x, const void* smooth, const void* lor
 // DPAS header.
 std::size_t svdquant_workspace_elements(int m, int k, int r);
 
+// ---------------------------------------------------------------------------
+// Benchmark split-step entry points.
+//
+// These expose the three phases of the fused kernel as separate launches so
+// ``bench_svdquant_mxfp4.py`` can time an unfused three-step baseline against
+// the fused path (design doc section 4.3). They are benchmark interfaces only:
+// each forwards to exactly the same device kernel the fused path uses and adds
+// no new device logic. Do not grow them into a production API.
+// ---------------------------------------------------------------------------
+
+// Split step 1: smooth + dynamic MXFP4 quantize + pack, quant-only path.
+// Produces ``qact`` [M, K/2] and ``ascales`` [M, K/32], bit-identical to the
+// fused kernel's quantization phase. ``smooth`` is FP32 (or null). Calls
+// ``launch_quant_only``.
+void smooth_quant(void* stream, const void* x, const void* smooth, void* qact, void* ascales, int m, int k,
+                  int x_dtype);
+
+// Split step 2: fold ``smooth`` into ``lora_down`` and emit the split B planes
+// ``hi`` / ``lo``, laid out exactly as the fused CUTE path expects them. Callers
+// size each plane with :func:`svdquant_lora_plane_elements`; ``smooth`` is FP32,
+// ``lora_down`` and both planes share ``lora_down``'s dtype. Calls
+// ``launch_pack_lora_b_cute``.
+void prepare_lora(void* stream, const void* smooth, const void* lora_down, void* hi, void* lo, int k, int r,
+                  int dtype);
+
+// Split step 3: standalone low-rank down projection
+// ``lora_act[M, R] = x[M, K] @ (B_hi + B_lo)``. ``x`` is the raw (unsmoothed)
+// activation -- ``smooth`` was already folded into ``hi``/``lo`` by
+// :func:`prepare_lora` -- and ``lora_act`` matches ``x``'s dtype. Calls the
+// same CUTE/DPAS projection the fused path uses (``launch_lora_cute``).
+void lora_projection(void* stream, const void* x, const void* hi, const void* lo, void* lora_act, int m, int k, int r,
+                     int x_dtype);
+
+// Elements in one split B plane (``hi`` or ``lo``) for a ``[K, R]`` lora_down.
+// Exposed so Python can allocate the planes without reimplementing the private
+// DPAS surface layout (``cute_b_cols`` padding).
+std::size_t svdquant_lora_plane_elements(int k, int r);
+
 }  // namespace svdquant
 }  // namespace ark

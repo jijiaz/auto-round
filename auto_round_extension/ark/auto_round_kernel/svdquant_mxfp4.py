@@ -356,6 +356,210 @@ def _quant_down_ark(
     return qact, ascales, lora_act
 
 
+# ---------------------------------------------------------------------------
+# Benchmark split-step wrappers.
+#
+# These expose each phase of the fused kernel as its own standalone device
+# launch so ``bench_svdquant_mxfp4.py`` can time the unfused three-step baseline
+# (design doc section 4.3) against the fused path:
+#
+#   1. smooth + quant   -> launch_quant_only            (bit-identical qact/ascales)
+#   2. prepare_lora     -> launch_pack_lora_b_cute      (hi + lo split B planes)
+#   3. lora_down        -> launch_lora_cute             (CUTE/DPAS projection)
+#
+# They are benchmark interfaces only -- each forwards to the same device kernel
+# the fused path uses and adds no new device logic. Outputs and any workspace
+# are allocated here; callers pass torch tensors, never raw pointers.
+# ---------------------------------------------------------------------------
+
+_SPLIT_SYMBOLS = (
+    "svdquant_mxfp4_smooth_quant",
+    "svdquant_mxfp4_prepare_lora",
+    "svdquant_mxfp4_lora_down",
+    "svdquant_mxfp4_lora_plane_elements",
+)
+
+
+def split_kernel_available() -> bool:
+    """True when the XPU build exports the split-step benchmark symbols."""
+
+    try:
+        from .xpu_loader import ensure_xpu_lib
+
+        ensure_xpu_lib(required_symbols=_SPLIT_SYMBOLS)
+    except Exception:
+        return False
+    return True
+
+
+def svdquant_mxfp4_smooth_quant(
+    x: torch.Tensor,
+    smooth: torch.Tensor | None = None,
+    *,
+    qact: torch.Tensor | None = None,
+    ascales: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split step 1: ARK smooth + MXFP4 quantize + pack.
+
+    Standalone launch of the fused kernel's quantization phase. ``qact`` and
+    ``ascales`` are bit-identical to what :func:`svdquant_mxfp4_quant_down`
+    produces for the same ``x`` / ``smooth``.
+
+    ``qact`` / ``ascales`` may be preallocated output buffers: when given, the
+    kernel writes in place and nothing is allocated on the launch path. The
+    benchmark uses this to time a pure kernel launch (the README's preallocated
+    three-step baseline).
+    """
+
+    _validate_inputs(x, smooth, None)
+    from . import cvt_dtype, get_stream
+    from .xpu_loader import ensure_xpu_lib
+
+    library = ensure_xpu_lib(required_symbols=_SPLIT_SYMBOLS)
+
+    x = x.contiguous()
+    rows, columns = x.shape
+    smooth = None if smooth is None else smooth.to(torch.float32).contiguous()
+
+    if qact is None:
+        qact = torch.empty((rows, columns // 2), dtype=torch.uint8, device=x.device)
+    elif qact.shape != (rows, columns // 2) or qact.dtype != torch.uint8 or qact.device != x.device:
+        raise ValueError(f"qact must be uint8 of shape {(rows, columns // 2)} on device {x.device}")
+    if ascales is None:
+        ascales = torch.empty((rows, columns // GROUP_SIZE), dtype=torch.uint8, device=x.device)
+    elif (
+        ascales.shape != (rows, columns // GROUP_SIZE) or ascales.dtype != torch.uint8 or ascales.device != x.device
+    ):
+        raise ValueError(f"ascales must be uint8 of shape {(rows, columns // GROUP_SIZE)} on device {x.device}")
+
+    library.svdquant_mxfp4_smooth_quant(
+        stream=get_stream(x),
+        x=x.data_ptr(),
+        smooth=0 if smooth is None else smooth.data_ptr(),
+        qact=qact.data_ptr(),
+        ascales=ascales.data_ptr(),
+        m=rows,
+        k=columns,
+        x_dtype=cvt_dtype(x.dtype),
+    )
+    return qact, ascales
+
+
+def svdquant_mxfp4_prepare_lora(
+    smooth: torch.Tensor,
+    lora_down: torch.Tensor,
+    *,
+    hi: torch.Tensor | None = None,
+    lo: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split step 2: ARK LoRA operand preparation.
+
+    Folds ``smooth`` into ``lora_down`` and emits the two 16-bit split planes
+    (``hi`` + ``lo``) in the exact layout the fused CUTE/DPAS path consumes.
+    Size each plane with the private-layout query the kernel exposes.
+
+    ``hi`` / ``lo`` may be preallocated output buffers: when given, the kernel
+    writes in place and nothing is allocated on the launch path. The benchmark
+    uses this to time a pure kernel launch.
+    """
+
+    if not isinstance(smooth, torch.Tensor) or smooth.ndim != 1:
+        raise ValueError("smooth must be a 1D torch.Tensor of shape [K]")
+    if not isinstance(lora_down, torch.Tensor) or lora_down.ndim != 2:
+        raise ValueError("lora_down must be a 2D torch.Tensor of shape [R, K]")
+    if smooth.shape[0] != lora_down.shape[1]:
+        raise ValueError(f"smooth length {smooth.shape[0]} does not match lora_down K dimension {lora_down.shape[1]}")
+    if lora_down.dtype not in _SUPPORTED_INPUT_DTYPES:
+        raise ValueError(f"lora_down dtype must be one of {_SUPPORTED_INPUT_DTYPES}, got {lora_down.dtype}")
+    if smooth.device != lora_down.device:
+        raise ValueError(f"smooth must be on device {lora_down.device}, got {smooth.device}")
+
+    from . import cvt_dtype, get_stream
+    from .xpu_loader import ensure_xpu_lib
+
+    library = ensure_xpu_lib(required_symbols=_SPLIT_SYMBOLS)
+
+    smooth = smooth.to(torch.float32).contiguous()
+    lora_down = lora_down.contiguous()
+    columns, rank = lora_down.shape[1], lora_down.shape[0]
+
+    plane = int(library.svdquant_mxfp4_lora_plane_elements(k=columns, r=rank))
+    if hi is None:
+        hi = torch.empty(plane, dtype=lora_down.dtype, device=lora_down.device)
+    elif hi.shape != (plane,) or hi.dtype != lora_down.dtype or hi.device != lora_down.device:
+        raise ValueError(f"hi must be {lora_down.dtype} of shape {(plane,)} on device {lora_down.device}")
+    if lo is None:
+        lo = torch.empty(plane, dtype=lora_down.dtype, device=lora_down.device)
+    elif lo.shape != (plane,) or lo.dtype != lora_down.dtype or lo.device != lora_down.device:
+        raise ValueError(f"lo must be {lora_down.dtype} of shape {(plane,)} on device {lora_down.device}")
+
+    library.svdquant_mxfp4_prepare_lora(
+        stream=get_stream(lora_down),
+        smooth=smooth.data_ptr(),
+        lora_down=lora_down.data_ptr(),
+        hi=hi.data_ptr(),
+        lo=lo.data_ptr(),
+        k=columns,
+        r=rank,
+        dtype=cvt_dtype(lora_down.dtype),
+    )
+    return hi, lo
+
+
+def svdquant_mxfp4_lora_down(
+    x: torch.Tensor,
+    hi: torch.Tensor,
+    lo: torch.Tensor,
+    rank: int,
+    *,
+    lora_act: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Split step 3: ARK standalone low-rank down projection.
+
+    ``lora_act[M, R] = x[M, K] @ (B_hi + B_lo)`` over the planes produced by
+    :func:`svdquant_mxfp4_prepare_lora`. Uses the same CUTE/DPAS projection as
+    the fused path -- never ``torch.matmul``.
+
+    ``lora_act`` may be a preallocated output buffer: when given, the kernel
+    writes in place and nothing is allocated on the launch path. The benchmark
+    uses this to time a pure kernel launch.
+    """
+
+    if not isinstance(x, torch.Tensor) or x.ndim != 2:
+        raise ValueError("x must be a 2D torch.Tensor of shape [M, K]")
+    if rank <= 0 or rank > MAX_RANK:
+        raise ValueError(f"rank must be in [1, {MAX_RANK}], got {rank}")
+    if x.device.type != "xpu":
+        raise RuntimeError("svdquant_mxfp4_lora_down requires an XPU tensor")
+    if x.device != hi.device or x.device != lo.device:
+        raise ValueError("x, hi and lo must be on the same device")
+
+    from . import cvt_dtype, get_stream
+    from .xpu_loader import ensure_xpu_lib
+
+    library = ensure_xpu_lib(required_symbols=_SPLIT_SYMBOLS)
+
+    x = x.contiguous()
+    rows, columns = x.shape
+
+    if lora_act is None:
+        lora_act = torch.empty((rows, rank), dtype=x.dtype, device=x.device)
+    elif lora_act.shape != (rows, rank) or lora_act.dtype != x.dtype or lora_act.device != x.device:
+        raise ValueError(f"lora_act must be {x.dtype} of shape {(rows, rank)} on device {x.device}")
+    library.svdquant_mxfp4_lora_down(
+        stream=get_stream(x),
+        x=x.data_ptr(),
+        hi=hi.data_ptr(),
+        lo=lo.data_ptr(),
+        lora_act=lora_act.data_ptr(),
+        m=rows,
+        k=columns,
+        r=rank,
+        x_dtype=cvt_dtype(x.dtype),
+    )
+    return lora_act
+
+
 def svdquant_mxfp4_quant_down(
     x: torch.Tensor,
     smooth: torch.Tensor | None = None,

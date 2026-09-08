@@ -1328,6 +1328,33 @@ static void svdquant_mxfp4_quant_down(torch_ptr stream, torch_ptr x, torch_ptr s
 static int64_t svdquant_mxfp4_workspace_elements(int m, int k, int r) {
   return static_cast<int64_t>(ark::svdquant::svdquant_workspace_elements(m, k, r));
 }
+
+// Benchmark split-step wrappers. Each launches one phase of the fused kernel as
+// a standalone device op, so `bench_svdquant_mxfp4.py` can time the unfused
+// three-step baseline against the fused path. See
+// wrapper/include/sycl_svdquant_mxfp4.hpp for the per-phase contracts.
+static void svdquant_mxfp4_smooth_quant(torch_ptr stream, torch_ptr x, torch_ptr smooth, torch_ptr qact,
+                                        torch_ptr ascales, int m, int k, int x_dtype) {
+  ark::svdquant::smooth_quant((void*)stream, (const void*)x, (const void*)smooth, (void*)qact, (void*)ascales, m, k,
+                              x_dtype);
+}
+
+static void svdquant_mxfp4_prepare_lora(torch_ptr stream, torch_ptr smooth, torch_ptr lora_down, torch_ptr hi,
+                                        torch_ptr lo, int k, int r, int dtype) {
+  ark::svdquant::prepare_lora((void*)stream, (const void*)smooth, (const void*)lora_down, (void*)hi, (void*)lo, k, r,
+                              dtype);
+}
+
+static void svdquant_mxfp4_lora_down(torch_ptr stream, torch_ptr x, torch_ptr hi, torch_ptr lo, torch_ptr lora_act,
+                                     int m, int k, int r, int x_dtype) {
+  ark::svdquant::lora_projection((void*)stream, (const void*)x, (const void*)hi, (const void*)lo, (void*)lora_act, m,
+                                 k, r, x_dtype);
+}
+
+// Elements in one split B plane (hi or lo), so Python can allocate them.
+static int64_t svdquant_mxfp4_lora_plane_elements(int k, int r) {
+  return static_cast<int64_t>(ark::svdquant::svdquant_lora_plane_elements(k, r));
+}
 #endif  // ARK_XPU
 
 }  // namespace ark
@@ -1418,6 +1445,17 @@ PYBIND11_MODULE(PY_NAME, m) {
         pybind11::arg("r"), pybind11::arg("x_dtype"), pybind11::arg("lora_dtype"));
   m.def("svdquant_mxfp4_workspace_elements", &ark::svdquant_mxfp4_workspace_elements, pybind11::arg("m"),
         pybind11::arg("k"), pybind11::arg("r"));
+  m.def("svdquant_mxfp4_smooth_quant", &ark::svdquant_mxfp4_smooth_quant, pybind11::arg("stream"), pybind11::arg("x"),
+        pybind11::arg("smooth"), pybind11::arg("qact"), pybind11::arg("ascales"), pybind11::arg("m"),
+        pybind11::arg("k"), pybind11::arg("x_dtype"));
+  m.def("svdquant_mxfp4_prepare_lora", &ark::svdquant_mxfp4_prepare_lora, pybind11::arg("stream"),
+        pybind11::arg("smooth"), pybind11::arg("lora_down"), pybind11::arg("hi"), pybind11::arg("lo"),
+        pybind11::arg("k"), pybind11::arg("r"), pybind11::arg("dtype"));
+  m.def("svdquant_mxfp4_lora_down", &ark::svdquant_mxfp4_lora_down, pybind11::arg("stream"), pybind11::arg("x"),
+        pybind11::arg("hi"), pybind11::arg("lo"), pybind11::arg("lora_act"), pybind11::arg("m"), pybind11::arg("k"),
+        pybind11::arg("r"), pybind11::arg("x_dtype"));
+  m.def("svdquant_mxfp4_lora_plane_elements", &ark::svdquant_mxfp4_lora_plane_elements, pybind11::arg("k"),
+        pybind11::arg("r"));
 #endif  // ARK_XPU
 #if !defined(ARK_XPU)
   pybind11::class_<ark::cpu::ReorderKVShape>(m, "ArkCpuPackedKVDescriptor")

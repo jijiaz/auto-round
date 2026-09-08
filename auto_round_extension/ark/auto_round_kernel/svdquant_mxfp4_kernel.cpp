@@ -373,6 +373,71 @@ void dispatch_flags(sycl::queue* queue, const void* x, const void* smooth, const
   }
 }
 
+// ---------------------------------------------------------------------------
+// Split-step dispatch helpers (benchmark-only).
+//
+// These mirror dispatch_flags but expose each phase of the fused kernel as its
+// own launch so the benchmark can time the unfused three-step baseline against
+// the fused path. Each forwards straight to the kernel the fused path uses, so
+// the comparison is of scheduling (separate launches, re-read of `x`) rather
+// than arithmetic: `launch_quant_only` is bit-identical to the fused kernel's
+// quantization phase, and the standalone projection is the same CUTE/DPAS
+// arithmetic in a different row/K grouping.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+void dispatch_smooth_quant(sycl::queue* queue, const void* x, const void* smooth, void* qact, void* ascales, int m,
+                           int k) {
+  const T* x_ptr = static_cast<const T*>(x);
+  const float* smooth_ptr = static_cast<const float*>(smooth);
+  uint8_t* qact_ptr = static_cast<uint8_t*>(qact);
+  uint8_t* ascales_ptr = static_cast<uint8_t*>(ascales);
+  if (use_double_log()) {
+    launch_quant_only<T, true>(queue, x_ptr, smooth_ptr, qact_ptr, ascales_ptr, m, k);
+  } else {
+    launch_quant_only<T, false>(queue, x_ptr, smooth_ptr, qact_ptr, ascales_ptr, m, k);
+  }
+}
+
+template <typename T>
+void dispatch_prepare_lora(sycl::queue* queue, const float* smooth, const T* lora_down, T* hi, T* lo, int k, int r) {
+  launch_pack_lora_b_cute<T>(queue, smooth, lora_down, hi, lo, k, r);
+}
+
+// Standalone projection dispatch. Unlike the fused kernel, which pins Rows to
+// kFusedCuteRows (one lane per row for the quantization phase), the standalone
+// kernel is free to use the row count the sycl-tla probe sweep measured best
+// (8), honoring the same ARK_SVDQUANT_CUTE_ROWS override the sweep uses.
+template <typename T>
+void dispatch_lora_projection(sycl::queue* queue, const T* x, const T* hi, const T* lo, T* lora_act, int m, int k,
+                              int r) {
+  const int n_tiles = lora_n_tiles(r);
+  const int rows = cute_rows_for(m, n_tiles);
+#define ARK_SVDQ_LAUNCH_LORA_CUTE(NT)                                                                                 \
+  if (rows == 8) {                                                                                                    \
+    launch_lora_cute<T, NT, 8>(queue, x, hi, lo, lora_act, m, k, r);                                                  \
+  } else if (rows == 16) {                                                                                            \
+    launch_lora_cute<T, NT, 16>(queue, x, hi, lo, lora_act, m, k, r);                                                 \
+  } else {                                                                                                            \
+    launch_lora_cute<T, NT, 32>(queue, x, hi, lo, lora_act, m, k, r);                                                 \
+  }
+  switch (n_tiles) {
+    case 1:
+      ARK_SVDQ_LAUNCH_LORA_CUTE(1)
+      break;
+    case 2:
+      ARK_SVDQ_LAUNCH_LORA_CUTE(2)
+      break;
+    case 3:
+      ARK_SVDQ_LAUNCH_LORA_CUTE(3)
+      break;
+    default:
+      ARK_SVDQ_LAUNCH_LORA_CUTE(4)
+      break;
+  }
+#undef ARK_SVDQ_LAUNCH_LORA_CUTE
+}
+
 }  // namespace
 
 #endif  // ARK_XPU
@@ -427,6 +492,107 @@ void quant_down(void* stream, const void* x, const void* smooth, const void* lor
   throw std::runtime_error("ark::svdquant::quant_down is only supported on XPU");
 #endif
 }
+
+// Split-step host wrappers, see the header for the contract. Each validates
+// only what the underlying kernel needs and dispatches on the BTLA_DTYPE code,
+// mirroring quant_down. No device logic lives here.
+
+void smooth_quant(void* stream, const void* x, const void* smooth, void* qact, void* ascales, int m, int k,
+                  int x_dtype) {
+#ifdef ARK_XPU
+  if (stream == nullptr) throw std::invalid_argument("ark::svdquant::smooth_quant: stream is null");
+  if (x == nullptr || qact == nullptr || ascales == nullptr) {
+    throw std::invalid_argument("ark::svdquant::smooth_quant: x, qact and ascales are required");
+  }
+  if (m <= 0 || k <= 0) throw std::invalid_argument("ark::svdquant::smooth_quant: m and k must be positive");
+  if (k % kGroupSize != 0) {
+    throw std::invalid_argument("ark::svdquant::smooth_quant: k must be a multiple of 32");
+  }
+
+  sycl::queue* queue = static_cast<sycl::queue*>(stream);
+  switch (static_cast<BTLA_DTYPE>(x_dtype)) {
+    case BTLA_DTYPE::F16:
+      dispatch_smooth_quant<sycl::half>(queue, x, smooth, qact, ascales, m, k);
+      break;
+    case BTLA_DTYPE::BF16:
+      dispatch_smooth_quant<sycl::ext::oneapi::bfloat16>(queue, x, smooth, qact, ascales, m, k);
+      break;
+    default:
+      throw std::invalid_argument("ark::svdquant::smooth_quant: x dtype must be float16 or bfloat16");
+  }
+#else
+  (void)stream; (void)x; (void)smooth; (void)qact; (void)ascales; (void)m; (void)k; (void)x_dtype;
+  throw std::runtime_error("ark::svdquant::smooth_quant is only supported on XPU");
+#endif
+}
+
+void prepare_lora(void* stream, const void* smooth, const void* lora_down, void* hi, void* lo, int k, int r,
+                  int dtype) {
+#ifdef ARK_XPU
+  if (stream == nullptr) throw std::invalid_argument("ark::svdquant::prepare_lora: stream is null");
+  if (smooth == nullptr || lora_down == nullptr || hi == nullptr || lo == nullptr) {
+    throw std::invalid_argument("ark::svdquant::prepare_lora: smooth, lora_down, hi and lo are required");
+  }
+  if (k <= 0 || r <= 0 || r > kMaxRank) {
+    throw std::invalid_argument("ark::svdquant::prepare_lora: rank must be in [1, 64]");
+  }
+
+  sycl::queue* queue = static_cast<sycl::queue*>(stream);
+  const float* smooth_ptr = static_cast<const float*>(smooth);
+  switch (static_cast<BTLA_DTYPE>(dtype)) {
+    case BTLA_DTYPE::F16:
+      dispatch_prepare_lora<sycl::half>(queue, smooth_ptr, static_cast<const sycl::half*>(lora_down),
+                                        static_cast<sycl::half*>(hi), static_cast<sycl::half*>(lo), k, r);
+      break;
+    case BTLA_DTYPE::BF16:
+      dispatch_prepare_lora<sycl::ext::oneapi::bfloat16>(
+          queue, smooth_ptr, static_cast<const sycl::ext::oneapi::bfloat16*>(lora_down),
+          static_cast<sycl::ext::oneapi::bfloat16*>(hi), static_cast<sycl::ext::oneapi::bfloat16*>(lo), k, r);
+      break;
+    default:
+      throw std::invalid_argument("ark::svdquant::prepare_lora: dtype must be float16 or bfloat16");
+  }
+#else
+  (void)stream; (void)smooth; (void)lora_down; (void)hi; (void)lo; (void)k; (void)r; (void)dtype;
+  throw std::runtime_error("ark::svdquant::prepare_lora is only supported on XPU");
+#endif
+}
+
+void lora_projection(void* stream, const void* x, const void* hi, const void* lo, void* lora_act, int m, int k, int r,
+                     int x_dtype) {
+#ifdef ARK_XPU
+  if (stream == nullptr) throw std::invalid_argument("ark::svdquant::lora_projection: stream is null");
+  if (x == nullptr || hi == nullptr || lo == nullptr || lora_act == nullptr) {
+    throw std::invalid_argument("ark::svdquant::lora_projection: x, hi, lo and lora_act are required");
+  }
+  if (m <= 0 || k <= 0) throw std::invalid_argument("ark::svdquant::lora_projection: m and k must be positive");
+  if (r <= 0 || r > kMaxRank) {
+    throw std::invalid_argument("ark::svdquant::lora_projection: rank must be in [1, 64]");
+  }
+
+  sycl::queue* queue = static_cast<sycl::queue*>(stream);
+  switch (static_cast<BTLA_DTYPE>(x_dtype)) {
+    case BTLA_DTYPE::F16:
+      dispatch_lora_projection<sycl::half>(queue, static_cast<const sycl::half*>(x), static_cast<const sycl::half*>(hi),
+                                           static_cast<const sycl::half*>(lo), static_cast<sycl::half*>(lora_act), m, k,
+                                           r);
+      break;
+    case BTLA_DTYPE::BF16:
+      dispatch_lora_projection<sycl::ext::oneapi::bfloat16>(
+          queue, static_cast<const sycl::ext::oneapi::bfloat16*>(x),
+          static_cast<const sycl::ext::oneapi::bfloat16*>(hi), static_cast<const sycl::ext::oneapi::bfloat16*>(lo),
+          static_cast<sycl::ext::oneapi::bfloat16*>(lora_act), m, k, r);
+      break;
+    default:
+      throw std::invalid_argument("ark::svdquant::lora_projection: x dtype must be float16 or bfloat16");
+  }
+#else
+  (void)stream; (void)x; (void)hi; (void)lo; (void)lora_act; (void)m; (void)k; (void)r; (void)x_dtype;
+  throw std::runtime_error("ark::svdquant::lora_projection is only supported on XPU");
+#endif
+}
+
+std::size_t svdquant_lora_plane_elements(int k, int r) { return cute_b_plane_elements(k, r); }
 
 }  // namespace svdquant
 }  // namespace ark
